@@ -1,443 +1,348 @@
-/*
-  Collect Cylinder Temperatures from Three LM35 sensors on the Hot Water Cylinder and use
-  the top one to control the destratification pump via a PID algorithm
-  (obtained from the Arduino site - library)
-  Also drives serial LCD display to show various values including gradient of energy over time, based on an array of 
-  sampled values used to produce a rolling average
-  Also drives main relay to disengage the gas central heating cylinder thermostat when the water is hot enough (but leaving 'headroom' for solar heating)
-  9/6/2014 - added flash to Amber LED when capacity < 'lowAlarm' value (also used to display warning message) and increased gain on proportional PID parameter
-  11/6/2014 - changed PID setPoint to be actual centigrade value, rather than ADC one. Also reduced LED flash count to give max of 10 (not 11)
-  13/6/2014 - moved PID compute call into timed section that runs on fixed cycle (this to improve the I D calculation accuracy). Also increased Max Energy to 7.8kWh and TTop setpoint to 60C
-  17/6/2014 - implemented SetSampleTime from PID library to manage sample rate (instead of using change of 13/6/2014. Also turned off all but proportional PID. 
-              Increased energy steady deadband from 0.03 to 0.04. Also fixed non-working "Tank Is Full" message
-  19/6/2014 - changed temp print out to show decimal places. Also changed setpoint to 61C
-  20/6/2014 - increased max energy to 8.2 kWh and TTop setpoint to 62C. Also reduced PID sample time from 30s to 15s
-  24/6/2014 - Added Integral cooeficient back into PID. Improved format of temperature displays. Reduced energy averaging interval to 10 Secs 
-  29/6/2014 - Reduced "I" value from 10 to 5 and threashold for displaying "Temp Steady" from 0.015 to 0.01
-  12/8/2014 - Elliminated "I" from PID. Reduced "P" coefficient from 150 to 120. Changed logic to flash amber LED to indicate energy level (until full, when green LED comes on). 1 flash = 10% of energy
-  24/8/2014 - Increased Top Temp Setpoint to 63C and reduced PID cooefficients to 60,0.05,0
-  30/8/2014 - Added 'ripple' flash of all LEDs to indicate when midTemp is below alarm level
-  3/9/2014 - Reduced "I" to 0.01 (was 0.05)
-  17/10/2014 - Changed control of Boiler relay to be based on TTop (rather than Capacity). Also changed to control via a second PID loop and code from Arduino PID library to allow this to drive a relay
-  28/10/2014 - reduce Relay setpoint to 52 degrees (rather than 55). Added boiler % to LCD display. Set minimum boiler on time to 60 secs.
-                Increased window to 10 mins. Increased energy averaging to 25 sample 15s apart
-  29/10/2014 - reduced boiler PID "P" value from 20 to 15 to reduce overshoot
-  31/10/2014 - set trap to inhibit PID control of boiler when TTop is above relaySetPoint
-  3/11/2014 - reduced "I" parameter from 1 to 0.1
-  7/11/2014 - Changed boiler control to work from middleTemp instead of TTop
-  11/12/2014 - Confirmed P30 0I 0D settings using test code on prototype Arduino. Have now added code to change I to 0.01 when error is less than 1.5 degrees C
-  16/12/2014 - Adjusted energy array and sample time to 40 samples 15S apart. Also increased 'temp steady' threshold from 0.01 to 0.02
- */
+/***************************************************
+  This is an example sketch for the Adafruit 2.2" SPI display.
+  This library works with the Adafruit 2.2" TFT Breakout w/SD card
+  ----> http://www.adafruit.com/products/1480
+ 
+  Check out the links above for our tutorials and wiring diagrams
+  These displays use SPI to communicate, 4 or 5 pins are required to
+  interface (RST is optional)
+  Adafruit invests time and resources providing this open source code,
+  please support Adafruit and open-source hardware by purchasing
+  products from Adafruit!
 
-// include the library code:
-#include <PID_v1.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
-LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);  // Set the LCD I2C address
-//
-const int bottomTempPin = 8; // analog pin for bottom transducer
-const int middleTempPin = 9; // analog pin for middle transducer
-const int topTempPin = 10; // analog pin for top transducer
-const int pumpPin = 10; // PWM pin for pump control
-const int offLEDPin = 31; // Pin for driving Red/Amber LED indicating pump is off
-const int fullLEDPin = 33; // Pin for driving LED indicating that Cylinder is 'full'
-const int pumpLEDPin = 35; // Pin for driving pump active LED
-const int meterPin = 9; //PWM pin for 'fuel gauge' (NOT CURRENTLY USED)
-const int relayPin = 11; // Pin used to drive Central Heating Relay
-const int lowAlarm = 42; // % of energy below which warning is displayed
-//
-double Setpoint; //define Destratification pump PID setpoint variable
-double tempInput; // variable to be used for measured temperature value
-double pumpSpeed = 0; //initialise pump PWM output variable
-double minPumpSpeed = 0; //minimum PWM value to be used for pump
-double maxPumpSpeed = 255; //maximum PWM value available
-double boilerLevel = 0; //initialise boiler PID output variable
-//
-int topADCValue = 0; //variable to store ADC value
-int middleADCValue = 0; //variable to store ADC value
-int bottomADCValue = 0; //variable to store ADC value
-int flashCount = 0; // Used in flash function to indicate pump speed
-int flashCountE = 0; //Used to flash function to indicate energy level
-int smoothingIndex = 10; // used to smooth temperature measurements
-// int energySteady = 0; // Used to inhibit pump if the energy is steady : 0 = energy changing, 1 = energy not changing
-double topTemp;
-double middleTemp;
-double bottomTemp;
-double relaySetPoint = 42; // middleTemp value at which relay will be energised and prevent further gas heating of the water
-float energy; // Variable to hold calculated energy above 15C that gives an indication of the total heat in the cylinder
-float maxEnergy = 8.2; // total capacity of the cylinder in kWh - used to halt destrat activity (Was 7.8)
-const unsigned nRecentEnergies = 40; //Number of recent energy values to store. MUST BE EVEN.
-float recentEnergies[nRecentEnergies]; // Create array to store energy readings
-unsigned recentEnergiesIndex = 0; // initialise pointer to enegy array
-unsigned recentEnergiesInterval = 15000; // time between successive energy readings (ms)
-float newAverageEnergy = 0.0f; // variable to store calculated value of most recent energy average
-float oldAverageEnergy = 0.0f; // variable to store calculated value of earlier energy average
-float energyGradient = 0.0f; // variable to store calculated rate of change in energy over time 
-const float deltaTime = (float)nRecentEnergies * 0.5f * (float)recentEnergiesInterval; // time between old and new average energy measurements - used to calculate the gradient
-unsigned elapsedMillis = 0; // to allow millis function to be used to time sampling rate
-unsigned newMillis = 0; // as above
-float hoursUntilFull = 1.0f / 0.0f;
-unsigned long windowSize = 600000; // value for relay control window size
-unsigned long windowStartTime; //used for relay control
-unsigned long now; // used for boiler relay on-time calc
-unsigned long boilerOn = 0; // value used to store scaled version of boiler demand level
-float boilerPercent; // variable to hold % boiler level
-  //
-  // Function to ConvertADC Values to Degrees C
-  //
-float calcTempFromReadValue(int readValue);
-void flashLED(); //function to flash LED on Arduino board
-// initialize the pump PID Loop
-PID myPID(&topTemp, &pumpSpeed, &Setpoint,60,0.01,0, REVERSE);
-// initialize the Boiler PID Loop
-PID boilerPID(&middleTemp, &boilerLevel, &relaySetPoint, 30, 0, 0, DIRECT); // error (degrees) * P = boilerLevel value
-//
+  Written by Limor Fried/Ladyada for Adafruit Industries.
+  MIT license, all text above must be included in any redistribution
+ ****************************************************/
+ 
+#include "SPI.h"
+#include "Adafruit_GFX.h"
+#include "Adafruit_ILI9340.h"
+
+#if defined(__SAM3X8E__)
+    #undef __FlashStringHelper::F(string_literal)
+    #define F(string_literal) string_literal
+#endif
+
+// These are the pins used for the UNO
+// for Due/Mega/Leonardo use the hardware SPI pins (which are different)
+#define _sclk 52
+#define _miso 50
+#define _mosi 51
+#define _cs 53
+#define _dc 9
+#define _rst 8
+
+// Using software SPI is really not suggested, its incredibly slow
+//Adafruit_ILI9340 tft = Adafruit_ILI9340(_cs, _dc, _mosi, _sclk, _rst, _miso);
+// Use hardware SPI
+Adafruit_ILI9340 tft = Adafruit_ILI9340(_cs, _dc, _rst);
+
 void setup() {
-  // Set up pins for status LEDs
-  pinMode(pumpLEDPin,OUTPUT);
-  pinMode(fullLEDPin,OUTPUT);
-  pinMode(offLEDPin,OUTPUT);
-  pinMode(relayPin,OUTPUT);
-  //
-  windowStartTime = millis(); //initialise value for relay control
-  //
-  tempInput = analogRead(topTempPin); //read temperature value (no longer used
-  Setpoint = 63; // initilise temperature (in celsius) setpoint for destratification pump PID control algorithm
-  //
-  myPID.SetOutputLimits(minPumpSpeed, maxPumpSpeed); 
-  myPID.SetMode(AUTOMATIC); // turn on the PID loop
-  myPID.SetSampleTime(20000); // from PID library - sets sample time to X milliseconds
-  //
-  boilerPID.SetMode(AUTOMATIC); // turn on PID loop
-  //boilerPID.SetOutputLimits(0, windowSize); // Commented Out - since it doesn't seem to work (probably because my windowSize is too big?)
-  boilerPID.SetSampleTime(60000); // set sample time to 1 minute (note - this doesn't seem to work?)
-  //
-  Serial.begin(9600); //start serial comms
-  lcd.begin(16,2);
+  Serial.begin(9600);
+  while (!Serial);
   
-  for(unsigned i = 0; i < nRecentEnergies; ++i) // Initiatise array for storing temperature history (used in rolling average calculation)
-  {
-    recentEnergies[i] = 0.0f;
+  Serial.println("Adafruit 2.2\" SPI TFT Test!"); 
+ 
+  tft.begin();
+
+  Serial.println(F("Benchmark                Time (microseconds)"));
+  Serial.print(F("Screen fill              "));
+  Serial.println(testFillScreen());
+  delay(500);
+
+  Serial.print(F("Text                     "));
+  Serial.println(testText());
+  delay(3000);
+
+  Serial.print(F("Lines                    "));
+  Serial.println(testLines(ILI9340_CYAN));
+  delay(500);
+
+  Serial.print(F("Horiz/Vert Lines         "));
+  Serial.println(testFastLines(ILI9340_RED, ILI9340_BLUE));
+  delay(500);
+
+  Serial.print(F("Rectangles (outline)     "));
+  Serial.println(testRects(ILI9340_GREEN));
+  delay(500);
+
+  Serial.print(F("Rectangles (filled)      "));
+  Serial.println(testFilledRects(ILI9340_YELLOW, ILI9340_MAGENTA));
+  delay(500);
+
+  Serial.print(F("Circles (filled)         "));
+  Serial.println(testFilledCircles(10, ILI9340_MAGENTA));
+
+  Serial.print(F("Circles (outline)        "));
+  Serial.println(testCircles(10, ILI9340_WHITE));
+  delay(500);
+
+  Serial.print(F("Triangles (outline)      "));
+  Serial.println(testTriangles());
+  delay(500);
+
+  Serial.print(F("Triangles (filled)       "));
+  Serial.println(testFilledTriangles());
+  delay(500);
+
+  Serial.print(F("Rounded rects (outline)  "));
+  Serial.println(testRoundRects());
+  delay(500);
+
+  Serial.print(F("Rounded rects (filled)   "));
+  Serial.println(testFilledRoundRects());
+  delay(500);
+
+  Serial.println(F("Done!"));
+}
+
+void loop(void) {
+  for(uint8_t rotation=0; rotation<4; rotation++) {
+    tft.setRotation(rotation);
+    testText();
+    delay(2000);
   }
 }
-void loop() {
-  
-  //Set Gas Central Heating Override Relay
-  //
-  boilerPID.Compute();
-  boilerPercent = boilerLevel/2.55; // set boiler % variable
-  //
-  if (boilerLevel == 255)
-  {
-    boilerOn = windowSize;
+
+
+unsigned long testFillScreen() {
+  unsigned long start = micros();
+  tft.fillScreen(ILI9340_BLACK);
+  tft.fillScreen(ILI9340_RED);
+  tft.fillScreen(ILI9340_GREEN);
+  tft.fillScreen(ILI9340_BLUE);
+  tft.fillScreen(ILI9340_BLACK);
+  return micros() - start;
+}
+
+unsigned long testText() {
+  tft.fillScreen(ILI9340_BLACK);
+  unsigned long start = micros();
+  tft.setCursor(0, 0);
+  tft.setTextColor(ILI9340_WHITE);  tft.setTextSize(1);
+  tft.println("Hello World!");
+  tft.setTextColor(ILI9340_YELLOW); tft.setTextSize(2);
+  tft.println(1234.56);
+  tft.setTextColor(ILI9340_RED);    tft.setTextSize(3);
+  tft.println(0xDEADBEEF, HEX);
+  tft.println();
+  tft.setTextColor(ILI9340_GREEN);
+  tft.setTextSize(5);
+  tft.println("Groop");
+  tft.setTextSize(2);
+  tft.println("I implore thee,");
+  tft.setTextSize(1);
+  tft.println("my foonting turlingdromes.");
+  tft.println("And hooptiously drangle me");
+  tft.println("with crinkly bindlewurdles,");
+  tft.println("Or I will rend thee");
+  tft.println("in the gobberwarts");
+  tft.println("with my blurglecruncheon,");
+  tft.println("see if I don't!");
+  return micros() - start;
+}
+
+unsigned long testLines(uint16_t color) {
+  unsigned long start, t;
+  int           x1, y1, x2, y2,
+                w = tft.width(),
+                h = tft.height();
+
+  tft.fillScreen(ILI9340_BLACK);
+
+  x1 = y1 = 0;
+  y2    = h - 1;
+  start = micros();
+  for(x2=0; x2<w; x2+=6) tft.drawLine(x1, y1, x2, y2, color);
+  x2    = w - 1;
+  for(y2=0; y2<h; y2+=6) tft.drawLine(x1, y1, x2, y2, color);
+  t     = micros() - start; // fillScreen doesn't count against timing
+
+  tft.fillScreen(ILI9340_BLACK);
+
+  x1    = w - 1;
+  y1    = 0;
+  y2    = h - 1;
+  start = micros();
+  for(x2=0; x2<w; x2+=6) tft.drawLine(x1, y1, x2, y2, color);
+  x2    = 0;
+  for(y2=0; y2<h; y2+=6) tft.drawLine(x1, y1, x2, y2, color);
+  t    += micros() - start;
+
+  tft.fillScreen(ILI9340_BLACK);
+
+  x1    = 0;
+  y1    = h - 1;
+  y2    = 0;
+  start = micros();
+  for(x2=0; x2<w; x2+=6) tft.drawLine(x1, y1, x2, y2, color);
+  x2    = w - 1;
+  for(y2=0; y2<h; y2+=6) tft.drawLine(x1, y1, x2, y2, color);
+  t    += micros() - start;
+
+  tft.fillScreen(ILI9340_BLACK);
+
+  x1    = w - 1;
+  y1    = h - 1;
+  y2    = 0;
+  start = micros();
+  for(x2=0; x2<w; x2+=6) tft.drawLine(x1, y1, x2, y2, color);
+  x2    = 0;
+  for(y2=0; y2<h; y2+=6) tft.drawLine(x1, y1, x2, y2, color);
+
+  return micros() - start;
+}
+
+unsigned long testFastLines(uint16_t color1, uint16_t color2) {
+  unsigned long start;
+  int           x, y, w = tft.width(), h = tft.height();
+
+  tft.fillScreen(ILI9340_BLACK);
+  start = micros();
+  for(y=0; y<h; y+=5) tft.drawFastHLine(0, y, w, color1);
+  for(x=0; x<w; x+=5) tft.drawFastVLine(x, 0, h, color2);
+
+  return micros() - start;
+}
+
+unsigned long testRects(uint16_t color) {
+  unsigned long start;
+  int           n, i, i2,
+                cx = tft.width()  / 2,
+                cy = tft.height() / 2;
+
+  tft.fillScreen(ILI9340_BLACK);
+  n     = min(tft.width(), tft.height());
+  start = micros();
+  for(i=2; i<n; i+=6) {
+    i2 = i / 2;
+    tft.drawRect(cx-i2, cy-i2, i, i, color);
   }
-  else
-  {
-    boilerOn = (windowSize / 255) * boilerLevel; // calc scaled version of boiler demand level
+
+  return micros() - start;
+}
+
+unsigned long testFilledRects(uint16_t color1, uint16_t color2) {
+  unsigned long start, t = 0;
+  int           n, i, i2,
+                cx = tft.width()  / 2 - 1,
+                cy = tft.height() / 2 - 1;
+
+  tft.fillScreen(ILI9340_BLACK);
+  n = min(tft.width(), tft.height());
+  for(i=n; i>0; i-=6) {
+    i2    = i / 2;
+    start = micros();
+    tft.fillRect(cx-i2, cy-i2, i, i, color1);
+    t    += micros() - start;
+    // Outlines are not included in timing results
+    tft.drawRect(cx-i2, cy-i2, i, i, color2);
   }
-  if (middleTemp > relaySetPoint) //Override PID if TTop > setpoint
-  { 
-    boilerOn = 0;
-    boilerPercent = 0;
-  }
-  if ((relaySetPoint - middleTemp) < 1.5) // Routine to introduce "I" component when close to setpoint - to eliminate persistent error
-  {
-    boilerPID.SetTunings(30,0.1,0);
-  }
-  else
-  {
-    boilerPID.SetTunings(30,0,0);
-  } 
-  //Serial.println(" ");
-  //Serial.print("now - windowStartTime = ");
-  Serial.print((now - windowStartTime));
-  //Serial.print("windowSize = ");
-  //Serial.println(windowSize);
-  Serial.print(", ");
-  Serial.print(topTemp);
-  Serial.print(", ");
-  Serial.print(middleTemp);
-  Serial.print(", ");
-  Serial.print(bottomTemp);
-  Serial.print(", ");
-  Serial.print(boilerPercent);
-  Serial.print(", ");
-  Serial.print(((energy/maxEnergy)*100));
- //
- //************************************************
- //* turn the relay pin on/off based on pid output
- //************************************************
-  now = millis();
-  //
-  // Set trap to stop boiler On values less than one whole minute
-  //
-  if (boilerOn > 0)
-  {
-    if (boilerOn < 60000)
-    {
-      boilerOn = 60000;
+
+  return t;
+}
+
+unsigned long testFilledCircles(uint8_t radius, uint16_t color) {
+  unsigned long start;
+  int x, y, w = tft.width(), h = tft.height(), r2 = radius * 2;
+
+  tft.fillScreen(ILI9340_BLACK);
+  start = micros();
+  for(x=radius; x<w; x+=r2) {
+    for(y=radius; y<h; y+=r2) {
+      tft.fillCircle(x, y, radius, color);
     }
-  } 
- Serial.print(", ");
- Serial.println(boilerOn);
- // 
-  if(now - windowStartTime > windowSize)
-  { //time to shift the Relay Window
-    windowStartTime += windowSize;
   }
-  if(boilerOn > now - windowStartTime) digitalWrite(relayPin,HIGH);
-  else digitalWrite(relayPin,LOW);
-  //  
-  lcd.setCursor(0,0);
-  if (middleTemp < lowAlarm) // print warning if capacity is < lowAlarm
-  {
-   lcd.print("*** WARNING ****");
-   lcd.setCursor(0,1); // set to next line
-   lcd.print("** TEMP IS LOW *");
-   //
-   // FLASH ALL LEDs to Indicate LOW TEMP
-   digitalWrite(offLEDPin,HIGH);
-   digitalWrite(pumpLEDPin,LOW);
-   digitalWrite(fullLEDPin,LOW);
-   delay(100);
-   digitalWrite(offLEDPin,LOW);
-   digitalWrite(pumpLEDPin,HIGH);
-   digitalWrite(fullLEDPin,LOW);
-   delay(100);
-   digitalWrite(offLEDPin,LOW);
-   digitalWrite(pumpLEDPin,LOW);
-   digitalWrite(fullLEDPin,HIGH);
-   delay(100);
-   digitalWrite(offLEDPin,LOW);
-   digitalWrite(pumpLEDPin,HIGH);
-   digitalWrite(fullLEDPin,LOW);
-   delay(100);
-   digitalWrite(offLEDPin,HIGH);
-   digitalWrite(pumpLEDPin,LOW);
-   digitalWrite(fullLEDPin,LOW);
-   delay(100);
-   digitalWrite(offLEDPin,LOW);
-   digitalWrite(pumpLEDPin,HIGH);
-   digitalWrite(fullLEDPin,LOW);
-   delay(100);
-   digitalWrite(offLEDPin,LOW);
-   digitalWrite(pumpLEDPin,LOW);
-   digitalWrite(fullLEDPin,HIGH);
-   delay(100);
-   digitalWrite(offLEDPin,LOW);
-   digitalWrite(pumpLEDPin,HIGH);
-   digitalWrite(fullLEDPin,LOW);
-   delay(100);
-   digitalWrite(offLEDPin,HIGH);
-   digitalWrite(pumpLEDPin,LOW);
-   digitalWrite(fullLEDPin,LOW);
-   delay(100);
-   digitalWrite(offLEDPin,LOW);
-   digitalWrite(pumpLEDPin,LOW);
-   digitalWrite(fullLEDPin,LOW);
-   delay(100);
-   //
-   //digitalWrite(offLEDPin,LOW); //set Amber/Red LED OFF - to generate flash effect on this LED while capacity is below lowAlarm threshhold
-   //
-   delay(2000);
-   lcd.clear();
-  }
-  else // do nothing
-  {
-  }
-  //lcd.autoscroll();
- // char string[30];
- // sprintf(string, "T:%2dC M:%2dC B:%2dC", (int)topTemp, (int)middleTemp, (int)bottomTemp);
-  lcd.setCursor(0,0);
-  lcd.print(topTemp);
-  lcd.setCursor(5,0);
-  lcd.print(" ");
-  lcd.print(middleTemp);
-  lcd.setCursor(10,0);
-  lcd.print("  ");
-  lcd.print(bottomTemp);
-//  lcd.print(string);
-//
-  if(hoursUntilFull == hoursUntilFull) //hoursUntilFull is not NAN
-  {
-    char string[30];
-    
-    delay(2000);
-    lcd.setCursor(0, 0);
-    if(energy >= maxEnergy)
-    {
-      sprintf(string, "**Tank is Full**");
-      lcd.setCursor(0,0);
-      lcd.print(string);
-      delay(2000);
+
+  return micros() - start;
+}
+
+unsigned long testCircles(uint8_t radius, uint16_t color) {
+  unsigned long start;
+  int           x, y, r2 = radius * 2,
+                w = tft.width()  + radius,
+                h = tft.height() + radius;
+
+  // Screen is not cleared for this one -- this is
+  // intentional and does not affect the reported time.
+  start = micros();
+  for(x=0; x<w; x+=r2) {
+    for(y=0; y<h; y+=r2) {
+      tft.drawCircle(x, y, radius, color);
     }
-    if(abs(oldAverageEnergy - newAverageEnergy) < 0.02) // If change in energy is below threshold consider the temperatures to be steady
-    {
-      sprintf(string, "** Temp Steady *");
-//      energySteady = 1; // set flag to inhibit pump operation
-    }
-    else if(hoursUntilFull > 0.0f)
-    {
-      char number[10];
-      dtostrf(hoursUntilFull, 3, 1, number);
-      sprintf(string, "%s Hrs to Full ", number);
-//     energySteady = 0; //set flag to allow pump operation
-    }
-    else if(hoursUntilFull < 0.0f)
-    {
-      char number[10];
-      dtostrf(-hoursUntilFull, 3, 1, number);
-      sprintf(string, "%s Hrs to Empty", number);
-//      energySteady = 0; //set flag to allow pump operation
-    }
-    else //hoursUntilFull == 0.0f
-    {
-      sprintf(string, "**Inf Gradient**");
-    }
-    
-    lcd.print(string);
   }
-//  
-  lcd.setCursor(0,1); // set to second line
-//  
-  if (pumpSpeed > minPumpSpeed)
-  {
-    char string[30];
-    sprintf(string, "Pump %2d%% Cap %2d%%", (int)(pumpSpeed * 100.0f / (maxPumpSpeed-minPumpSpeed)),(int)((energy/maxEnergy)*100)); // thia line was changed to replace "255.0f" with calc value
-    lcd.print(string);
+
+  return micros() - start;
+}
+
+unsigned long testTriangles() {
+  unsigned long start;
+  int           n, i, cx = tft.width()  / 2 - 1,
+                      cy = tft.height() / 2 - 1;
+
+  tft.fillScreen(ILI9340_BLACK);
+  n     = min(cx, cy);
+  start = micros();
+  for(i=0; i<n; i+=5) {
+    tft.drawTriangle(
+      cx    , cy - i, // peak
+      cx - i, cy + i, // bottom left
+      cx + i, cy + i, // bottom right
+      tft.Color565(0, 0, i));
   }
-  else
-  {
-    char num1[10];
-    char num2[10];
-    dtostrf(energy, 5, 2, num1);
-    dtostrf((energy/maxEnergy)*100, 5, 1, num2);
-    lcd.print(num1); lcd.print(" kWh ");
-    lcd.print(num2); lcd.print("%");
+
+  return micros() - start;
+}
+
+unsigned long testFilledTriangles() {
+  unsigned long start, t = 0;
+  int           i, cx = tft.width()  / 2 - 1,
+                   cy = tft.height() / 2 - 1;
+
+  tft.fillScreen(ILI9340_BLACK);
+  start = micros();
+  for(i=min(cx,cy); i>10; i-=5) {
+    start = micros();
+    tft.fillTriangle(cx, cy - i, cx - i, cy + i, cx + i, cy + i,
+      tft.Color565(0, i, i));
+    t += micros() - start;
+    tft.drawTriangle(cx, cy - i, cx - i, cy + i, cx + i, cy + i,
+      tft.Color565(i, i, 0));
   }
-//  Print Boiler % if Running
-//
-  lcd.setCursor(0,1); // set to second line
-//  
-  if (boilerLevel > 0.9)
-  {
-    char string[30];
-    sprintf(string, "Boil %2d%% Cap %2d%%", (int)(boilerPercent),(int)((energy/maxEnergy)*100)); // this line was changed to replace "255.0f" with calc value
-    lcd.print(string);
+
+  return t;
+}
+
+unsigned long testRoundRects() {
+  unsigned long start;
+  int           w, i, i2,
+                cx = tft.width()  / 2 - 1,
+                cy = tft.height() / 2 - 1;
+
+  tft.fillScreen(ILI9340_BLACK);
+  w     = min(tft.width(), tft.height());
+  start = micros();
+  for(i=0; i<w; i+=6) {
+    i2 = i / 2;
+    tft.drawRoundRect(cx-i2, cy-i2, i, i, i/8, tft.Color565(i, 0, 0));
   }
-  else
-  {
-    // do nothing
+
+  return micros() - start;
+}
+
+unsigned long testFilledRoundRects() {
+  unsigned long start;
+  int           i, i2,
+                cx = tft.width()  / 2 - 1,
+                cy = tft.height() / 2 - 1;
+
+  tft.fillScreen(ILI9340_BLACK);
+  start = micros();
+  for(i=min(tft.width(), tft.height()); i>20; i-=6) {
+    i2 = i / 2;
+    tft.fillRoundRect(cx-i2, cy-i2, i, i, i/8, tft.Color565(0, i, 0));
   }
-  //
-    //Serial.println(" kWh");
-  //
-  topADCValue = analogRead(topTempPin);
-  topTemp = calcTempFromRead(topADCValue);
-  middleADCValue = analogRead(middleTempPin);
-  middleTemp = calcTempFromRead(middleADCValue);
-  bottomADCValue = analogRead(bottomTempPin);
-  bottomTemp = calcTempFromRead(bottomADCValue);
-  energy = ((((topTemp + middleTemp + bottomTemp)/3)-15)*170000*4.183)/3.6/1000000;
-  
-  newMillis = millis();
-  if(newMillis - elapsedMillis > recentEnergiesInterval)
-  {
-    recentEnergies[recentEnergiesIndex] = energy;
-    recentEnergiesIndex = (recentEnergiesIndex + 1) % nRecentEnergies;
-    newAverageEnergy = oldAverageEnergy = 0.0f;
-    for(unsigned i = recentEnergiesIndex; i < recentEnergiesIndex + (nRecentEnergies / 2); ++i)
-    {
-      oldAverageEnergy += recentEnergies[i % nRecentEnergies];
-    }
-    for(unsigned i = recentEnergiesIndex + (nRecentEnergies / 2); i < recentEnergiesIndex + nRecentEnergies; ++i)
-    {
-      newAverageEnergy += recentEnergies[i % nRecentEnergies];
-    }
-    newAverageEnergy /= (float)nRecentEnergies * 0.5f;
-    oldAverageEnergy /= (float)nRecentEnergies * 0.5f;
-    energyGradient = (newAverageEnergy - oldAverageEnergy)/deltaTime;
-    
-    hoursUntilFull = (maxEnergy - energy) / (energyGradient * 3600000.0f);
-    elapsedMillis = newMillis;
-    
-    //Print out array
-//    Serial.println("Recent energy levels");
-    for(unsigned i = 0; i < nRecentEnergies-1; ++i)
-    {
- //     Serial.print(recentEnergies[i]);
- //     Serial.print(" ");
-    }
- //   Serial.println(recentEnergies[nRecentEnergies-1]);
- //   Serial.print("New average energy: "); Serial.println(newAverageEnergy);
- //   Serial.print("Old average energy: "); Serial.println(oldAverageEnergy);
-  }
-  analogWrite(meterPin,(energy / maxEnergy)*255); // set voltage output for 'fuel gauge' (NOTE: not currently implemented)
-  //
-  //if (energySteady = 0) //Execute pump control if energy level is not steady
-  //{
-    if (energy < maxEnergy)
-    {
-      digitalWrite(fullLEDPin,LOW);
-      flashEnergyLED (); // Flash Amber LED to indicate energy level
-      tempInput = analogRead(topTempPin);
-      myPID.Compute(); // this line moved into timed energy smoothing loop
-      analogWrite(pumpPin,pumpSpeed);
-  //
-        if (pumpSpeed > minPumpSpeed) // flash pump LED when pump is running
-        {
-          //digitalWrite(offLEDPin,LOW);
-          flashLED();
-        }
-        else
-        {
-          digitalWrite(pumpLEDPin,LOW);
-          //digitalWrite(offLEDPin,HIGH);
-        }
-     } // end of energy < max energy 
-    else
-    {
-    // cylinder has reached capacity, so take no destrat action, just light the full LED
-    digitalWrite(fullLEDPin,HIGH);
-    digitalWrite(offLEDPin,LOW);
-    pumpSpeed = 0; // Stop Pump
-    analogWrite(pumpPin,pumpSpeed);
-    }
-//
-  delay(2000);
-  lcd.Backlight();
-  delay(5000);
-  lcd.nobacklight();
-} // end of main Loop
-//
-  // Function to ConvertADC Values to Degrees C
-  //
-  float calcTempFromRead(int readValue) {
-    return ((float)readValue * 500.0f) / 1024.0f;
-  }
- void flashLED() // Function to flash pump LED when pump is running. 0 to 10 flashes according to speed value
-{
-  flashCount = pumpSpeed;
-  while (flashCount > 0)
-  {
-    digitalWrite(pumpLEDPin, HIGH);
-    delay(200);
-    digitalWrite(pumpLEDPin,LOW);
-    delay(200);
-    flashCount = flashCount - 25.5;
-  }
-} 
-void flashEnergyLED() // Function to flash pump LED when pump is running. 0 to 10 flashes according to speed value
-{
-  flashCountE = ((energy/maxEnergy)*100);
-  while (flashCountE > 0)
-  {
-    digitalWrite(offLEDPin, HIGH);
-    delay(200);
-    digitalWrite(offLEDPin,LOW);
-    delay(200);
-    flashCountE = flashCountE - 10; 
- }
-} 
-  
+
+  return micros() - start;
+}
 
