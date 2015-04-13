@@ -25,7 +25,7 @@
 
 // These are the pins used for the UNO
 // for Due/Mega/Leonardo use the hardware SPI pins (which are different)
-#define _sclk 52
+#define _sclk 52 
 #define _miso 50
 #define _mosi 51
 #define _cs 53
